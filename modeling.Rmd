@@ -1,0 +1,1288 @@
+---
+title: "Modeling for Varroa Intensity"
+date: "2023-12-14"
+output:
+  pdf_document:
+    includes:
+      keep_tex: yes
+    number_sections: yes
+    toc_depth: 2
+  html_document:
+    number_sections: true
+editor_options: 
+  chunk_output_type: console
+---
+
+In this document, we fit the negative binomial regression models.
+```{r packages, include = FALSE, message = FALSE}
+#library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+library(readr)
+library(sf)
+library(gstat)
+#library(nlme)
+library(lubridate)
+library(viridis)
+library(sp)
+library(mgcv)
+library(xtable)
+#library(kableExtra)
+```
+
+```{r}
+apiary_data1819 <- read_csv("apiary_data1819.csv")
+apiary_data2021 <- read_csv("apiary_data2021.csv")
+```
+
+# Baseline Model
+
+$$Y_i \sim \mbox{Neg. Binomial}(\mu_i) $$
+$$\log(\mu_i) = \beta_0 + \beta_1\text{Day}_i + f(x_i, y_i)$$
+
+Modeling choices: 
+
+- linear fit (e.g. exponential growth) vs more flexible model for time
+
+- negative binomial vs quasipoisson
+
+- interaction of day and space
+
+## Linear or nonlinear fit?
+This one we tested with both the quasipoisson and negative binomial model fits. 
+We compare a model which is linear in time to a model (above), to a model with a non-linear fit:
+
+$$\log(\mu_i) = \beta_0 + f_1(\text{Day}_i) + f_2(x_i, y_i)$$
+
+
+```{r}
+# Quasi-poisson linear fit
+gam_glm_space_lin_qp <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30),
+                               data = apiary_data1819, family = quasipoisson)
+summary(gam_glm_space_lin_qp)
+
+# Negative binomial linear fit
+gam_glm_space_lin_nb <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30),
+                               data = apiary_data1819, family = nb)
+summary(gam_glm_space_lin_nb)
+
+# Quasi-poisson nonlinear fit
+gam_glm_space_time_plus_qp <- gam(mean_varroa ~ s(day_of_year, k = 4)  + s(x_km, y_km, k = 30),
+                               data = apiary_data1819, family = quasipoisson)
+# Negative binomial nonlinear fit
+gam_glm_space_time_plus_nb <- gam(mean_varroa ~ s(day_of_year, k = 4)  + s(x_km, y_km, k = 30),
+                               data = apiary_data1819, family = nb)
+
+# Compare linear to nonlinear quasipoisson models. 
+anova(gam_glm_space_lin_qp, gam_glm_space_time_plus_qp, test = "F")
+# Result: nonlinear is NOT significantly better
+
+# Compare linear to nonlinear negative binomial models
+anova(gam_glm_space_lin_nb, gam_glm_space_time_plus_nb, test = "Chisq")
+# Result: nonlinear is NOT significantly better than linear
+```
+
+Overall conclusion: The linear fit is good. This is equivalent to assuming exponential growth of Varroa over time.
+
+We can visually confirm this with the plot below. Here, we calculate the average log(mites) in 10 day bins and draw a linear fit. Since this fits well, the linear (exponential growth) model is a good fit. 
+```{r, echo = FALSE}
+apiary_data1819 %>%
+  mutate(day_bin = cut_width(day_of_year, width = 10, center = 5)) %>%
+  group_by(day_bin) %>%
+  summarize(log_mites = log(mean(mean_varroa)),
+            day_min = min(day_of_year)) %>%
+  ggplot(aes(day_min, log_mites)) + 
+  geom_point() + 
+ # geom_smooth(se = FALSE) + 
+  geom_smooth(method = lm, se = FALSE, col  = 2, lty = 2) + 
+  labs(x = "day of year")
+```
+
+
+
+##  Negative binomial vs quasipoisson
+
+The main difference between the negative binomial and quasipoisson models is the assumption about the relationship between mean and variance. 
+
+When we assume a traditional Poisson model, both the variance and mean of the Poisson distribution are controlled by a single parameter. Traditionally $\lambda$ is used to denote the mean of a Poisson distribution, but we will use $\mu$ to maintain consistent notation in this document. 
+The assumption that the variance also equals $\mu$ is overly restrictive for many data applications. 
+In the quasi-Poisson model, we assume that $Var(Y_i) = \phi\mu_i$, where $\phi$ is the overdispersion parameter and is a constant, typically greater than 1. This model is more flexible, and has quick computation time. A value of $\phi=1$ is equivalent to the Poisson model. However, it is not a true likelihood (thus "quasi" poisson) and therefore we cannot calcualte AIC. Common practice is also to use an F-test rather than a Likelihood Ratio Test (which uses $\chi^2$ distribution) to compare nested quasi-Poisson models, though there is not a lot of rigorous theory to support this chocie. Further, the assumption of a constant multilicative relationship between mean and variance is also overly restrictive in some applications.
+
+A negative binomial model is slightly more computationally expensive. This has led to somewhat slower adoption of the negative binomial model, even though the additional computing time is negligble with modern computing. The advantage of the negative binomial model is that is a true likelihood based method, so Likelihood Ratio Tests and AIC are still valid tools for model comparison. In the negative binomial model, the relationship between mean and variance is described by $Var(Y_i) = \mu_i + \mu_i^2/k$. In the limit, as $k^{-1}$ approaches 0, the negative binomial model approaches the Poisson.
+
+In order to evaluate the model choice, a typical approach is to explore the relationship between mean and variance in the observed data. If the relationship is linear, a quasipoisson model may be sufficient. A quadratic relationship suggests using the negative binomial. 
+
+In this first plot, we bin the data by 10 =-day increments, calculate the mean and variance for each bin, and plot variance vs. mean. 
+In this plot, we see that the quadratic fit (blue line) of variance to mean is better than the linear fit (red line), indicating preference for negative binomial over quasipoisson
+
+```{r, echo = FALSE}
+apiary_data1819 %>%
+  mutate(daybin = cut_width(day_of_year, 10, center = 105)) |> 
+  group_by(daybin) |> summarize(mean = mean(mean_varroa), var = var(mean_varroa)) |> 
+  drop_na(var) |>
+  ggplot(aes(x = mean, y = var)) + 
+  geom_point() + 
+  geom_smooth(se = FALSE, method = "lm", formula = "y ~ x + I(x^2)") + 
+  geom_smooth(method = "lm", se= FALSE, color = "red") +
+  labs(subtitle = "Blue: Neg binom; Red: Quasipoisson")
+```
+
+Alternatively, we can do the same thing, but put variance/mean on the y-axis. In this plot we look at the ratio of variance to mean on the y-axis. For a quasipoisson, this is assumed constant (red line) which we see is not a good fit, again indicating preference for negative binomial over quasipoisson. This is just a different view of what we see in the previous plot.
+
+```{r, echo = FALSE}
+apiary_data1819 %>%
+  mutate(daybin = cut_width(day_of_year, 10, center = 105)) |> 
+  group_by(daybin) |> summarize(mean = mean(mean_varroa), `var/mean` = var(mean_varroa)/mean(mean_varroa)) |> 
+  drop_na(`var/mean`) |>
+  ggplot(aes(x = mean, y = `var/mean`)) + 
+  geom_point() + 
+  geom_smooth(se = FALSE, method = "lm") + 
+  geom_smooth(method = "lm", formula= "y ~ 1", se= FALSE, color = "red") +
+  labs(subtitle = "Blue: Neg binom; Red: Quasipoisson")
+```
+
+Thus, all models going forward will use a negative binomial model approach. 
+
+
+
+## Interaction of day and location
+
+We next explore whether there is an interaction between day of year and location. That is, do certain areas of the state experience different growth rates of Varroa?
+
+```{r}
+gam_glm_space_lin_ixn_nb <- gam(mean_varroa ~ day_of_year + s(x_km, y_km, k = 30) + ti(x_km, y_km, day_of_year),
+                               data = apiary_data1819, family = nb)
+
+summary(gam_glm_space_lin_ixn_nb)
+
+anova(gam_glm_space_lin_nb, gam_glm_space_lin_ixn_nb, test = "Chisq")
+```
+
+The p-value comparing the non-interaction and the interaction model is 0.08, thus there is not sufficient evidence to suggest different growth rates in different locations. 
+This does not confirm a constant growth rate in the entire state; just that there is not sufficient data to demonstrate differences. It is possible that with more data, we could estimate such an interaction effect.
+
+Another comparsion we can make is with AIC (Akaike Information Criterion). In interpreting these metrics of model fit, lower values are better. They are only meaningful relative to other AIC values fit to the same data, there is no benchmark "good" value; a difference of 10 is considered large.
+
+```{r}
+AIC(gam_glm_space_lin_nb, gam_glm_space_lin_ixn_nb)
+```
+
+Both models have nearly equivalent AIC, suggesting the additve model is fitting the data equally well as the interaction model. Therefore, we prefer the more parsimonious additive model.
+
+
+We have therefore determined we will use a Negative binomial regression model, with a linear relationship to day (exponential growth) and spline fit for space/location, and we assume that the day and location effects are additive.
+
+
+```{r}
+gam_baseline <- apiary_data1819 %>%
+  drop_na(montrt, sup_feed) %>%
+  gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30),
+                               data = ., family = nb)
+
+summary(gam_baseline)
+summary(gam_glm_space_lin_nb)
+```
+
+
+# Adding Environmnental Variables
+
+In this section, we add environmental variables one at a time to the established baseline model.
+
+
+## Flor quality
+
+```{r}
+apiary_data1819 |> 
+  select(TrapezoidAverage, SpringFloral, SummerFloral, FallFloral) |>
+  cor() |>
+  round(2)
+```
+
+
+We use the trapezoid average. 
+
+```{r}
+gam_glm_trap1 <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  I(TrapezoidAverage/2),
+                               data = apiary_data1819, family = nb)
+
+gam_glm_trap1ixn <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  I(TrapezoidAverage/2) + day_of_year:I(TrapezoidAverage/2),
+                               data = apiary_data1819, family = nb)
+```
+
+```{r}
+# Additive model:
+summary(gam_glm_trap1)
+summary(gam_glm_trap1ixn)
+
+# Interaction with day:
+anova(gam_glm_space_lin_nb, gam_glm_trap1ixn, test = "Chisq")
+
+AIC(gam_glm_space_lin_nb, gam_glm_trap1, gam_glm_trap1ixn)
+```
+
+Result: neither the additive or interaction model is statistically significantly better than baseline. Not a meaningful difference in AIC between the models. 
+
+Separately, I ran the same models for summer, spring and fall floral, and receieved similar results. 
+
+
+## Insecticide use
+
+```{r}
+gam_glm_insect1 <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  Insecticide,
+                               data = apiary_data1819, family = nb)
+
+gam_glm_insect1ixn <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  Insecticide + day_of_year:Insecticide,
+                               data = apiary_data1819, family = nb)
+```
+
+```{r}
+#Additive
+summary(gam_glm_insect1)
+summary(gam_glm_insect1ixn)
+
+# Interaction with day:
+anova(gam_glm_space_lin_nb, gam_glm_insect1ixn, test = "Chisq")
+
+AIC(gam_glm_space_lin_nb, gam_glm_insect1, gam_glm_insect1ixn)
+```
+
+Result: neither the additive or interaction model is statistically significantly better than baseline. Not a meaningful difference in AIC between the models. 
+
+
+## Nesting quality
+
+```{r}
+gam_glm_nesting1 <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) + Nesting,
+                               data = apiary_data1819, family = nb)
+
+gam_glm_nesting1ixn <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  Nesting + day_of_year:Nesting,
+                               data = apiary_data1819, family = nb)
+```
+
+```{r}
+# Additive
+summary(gam_glm_nesting1)
+
+summary(gam_glm_nesting1ixn)
+
+# Interaction with day:
+anova(gam_glm_space_lin_nb, gam_glm_nesting1ixn, test = "Chisq")
+
+AIC(gam_glm_space_lin_nb, gam_glm_nesting1, gam_glm_nesting1ixn)
+```
+
+Result: neither the additive or interaction model is statistically significantly better than baseline. Not a meaningful difference in AIC between the models. 
+
+
+## Number of colonies within 5km
+Not significant in additive model, but is signficant in interaction.
+
+```{r}
+gam_glm_ncol1 <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  n_colonies_5km,
+                               data = apiary_data1819, family = nb)
+
+gam_glm_ncol1ixn <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  n_colonies_5km + day_of_year:n_colonies_5km,
+                               data = apiary_data1819, family = nb)
+```
+
+```{r}
+# Additive
+summary(gam_glm_ncol1)
+summary(gam_glm_ncol1ixn)
+
+gam_glm_ncol1ixn_centered <- gam(mean_varroa ~ I(day_of_year-120)  + s(x_km, y_km, k = 30) +  n_colonies_5km + I(day_of_year-120):n_colonies_5km,
+                               data = apiary_data1819, family = nb)
+summary(gam_glm_ncol1ixn_centered)
+
+# Interaction with day:
+summary(gam_glm_space_lin_nb)
+
+anova(gam_glm_space_lin_nb, gam_glm_ncol1ixn, test = "Chisq")
+
+AIC(gam_glm_space_lin_nb, gam_glm_ncol1, gam_glm_ncol1ixn)
+
+summary(gam_glm_ncol1ixn)$p.coef
+```
+I'm not sure what to make of this one. 
+
+The models suggest that Varroa intensity is significantly lower at the start of the season (May 1, see gam_glm_ncol1ixn_centered, negative slope on n_colonies_5km), but that areas with higher colony density will experience faster growth (positive slope on interaction). The Varroa intensities coincide at August 17.
+
+
+Creating plots for supplementary matrials: 
+
+```{r}
+apiary_data1819 %>%
+  mutate(ncol_bins = cut(n_colonies_5km, c(-0.5, 0.9, 1.5, 3.9, 8.2, 15.5,  Inf))) %>%
+  group_by(ncol_bins) %>%
+  summarize(floor(mean(n_colonies_5km, na.rm = TRUE)), n())
+```
+
+```{r}
+pred_data_ncol <- expand.grid(day_of_year = 120:300, 
+                              n_colonies_5km = c(0, 1, 2, 5, 10, 26), x_km = 0, y_km = 0) |> as_tibble()
+
+pred_data_ncol <- predict(gam_glm_ncol1ixn, newdata = pred_data_ncol, type = "link", se.fit = TRUE) |>
+  as_tibble() |>
+  mutate(mean_varroa = exp(fit), 
+         mean_lb = exp(fit - 2*se.fit), 
+         mean_ub = exp(fit + 2*se.fit)) |>
+  bind_cols(pred_data_ncol)|>
+  mutate(plot_day = ymd("2018-01-01") + day_of_year -1) %>%
+  rename(ncolbins = n_colonies_5km)
+
+
+col_dens_ixn_plot <- apiary_data1819 |> 
+  mutate(plot_day = make_date(year = 2018, month = month(Inspection_Date), day = mday(Inspection_Date))) |>
+    mutate(ncol_bins = cut(n_colonies_5km, c(-0.5, 0.9, 1.5, 3.9, 8.2, 15.5, Inf))) %>%
+  group_by(ncol_bins) %>%
+  mutate(ncolbins = floor(mean(n_colonies_5km, na.rm = TRUE))) %>%
+  ggplot(aes(plot_day, mean_varroa)) + 
+  #geom_point(aes(col = ifelse(Year < 2020, "2018-19", "2020-21")), alpha = 0.5)+ 
+  geom_point(size = 0.5) +
+  #geom_point(col = "black", shape = 1, alpha = 0.1) +
+#  geom_smooth(se = FALSE, span = 2, alpha = 0.5) +
+  geom_line(data = pred_data_ncol) + 
+  geom_ribbon(data = pred_data_ncol, aes(ymin = mean_lb, ymax = mean_ub), alpha = 0.1) +
+  facet_wrap(~ncolbins) + 
+  labs(color = "Num colonies\nwithin 5km",
+       x = "Time", 
+       y = "Varroa Intensity (mites per 300 Bees)") +
+ #   labs(color = "Years") +
+  coord_cartesian(ylim = c(0, 45))  +
+  theme_bw()+
+  scale_x_date(date_breaks = "month", date_labels = "%b")
+
+
+col_dens_ixn_plot2 <- ggplot(data = pred_data_ncol, aes(plot_day, mean_varroa)) + 
+  geom_line(aes(group = ncolbins), color = "black", linewidth = 1.1) +
+  geom_line(aes(col = ncolbins, group = ncolbins)) + 
+  labs(color = "Num colonies\nwithin 5km",
+       x = "Time", 
+       y = "Varroa Intensity (mites per 300 Bees)") +
+ #   labs(color = "Years") +
+  coord_cartesian(ylim = c(0, 45))  +
+  #theme_bw()+
+  scale_x_date(date_breaks = "month", date_labels = "%b")+  
+  scale_color_gradient(low = "white", high = "orange")  
+
+
+
+
+
+# pdf("plots/colony_dens_ixn_model.pdf", width = 6.5, height = 5)
+# col_dens_ixn_plot
+# dev.off()
+# 
+# postscript("plots/colony_dens_ixn_model.eps", width = 6.5, height = 5)
+# col_dens_ixn_plot
+# dev.off()
+# 
+# 
+# pdf("plots/colony_dens_ixn_model2.pdf", width = 6.5, height = 5)
+# col_dens_ixn_plot2
+# dev.off()
+# 
+# postscript("plots/colony_dens_ixn_model2.eps", width = 6.5, height = 5)
+# col_dens_ixn_plot2
+# dev.off()
+```
+
+
+
+
+
+
+
+
+# Adding Beekeeper variables
+
+## Varroa Montitoring and Treatment
+```{r}
+table(apiary_data1819$Monitor_prox, apiary_data1819$Treat_prox, dnn= c("monitor", "treat"), useNA = "ifany")
+```
+
+
+We consider 3 categories of Varroa management: Monitoring+Treatment, Treatment only, and None. 
+As seen above, there were 10 apiaries for which the "Monitor_prox" variable indicated 1 but Treatment_prox indicated 0 or NA. Upon examining other variables, it appears that most of these 15 do indeed also treat (some list last treatment date or number of times in last 12 months is > 0). Therefore, these 15 are included in the "Monitor + Treatment" group. There are an additional 35 apiaries with either Monitor prox or treatment prox or both, and these are excluded. I tested several other choices for putting NA values into different gruops, and their results remained the same. 
+
+```{r}
+gam_montrt <- apiary_data1819 %>%
+  drop_na(sup_feed) %>%
+     gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) + montrt,
+                               data = ., family = nb)
+
+summary(gam_montrt)
+
+
+gam_montrt_ixn <- apiary_data1819 %>%
+  drop_na(sup_feed) %>%
+     gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) + montrt + montrt:day_of_year,
+                               data = ., family = nb)
+
+summary(gam_montrt_ixn)
+exp(summary(gam_montrt_ixn)$p.coef)
+
+# growth for Trt only group:
+exp(0.00542 + 0.0114986)
+
+anova(gam_baseline, gam_montrt, test = "Chisq")
+anova(gam_baseline, gam_montrt_ixn, test = "Chisq")
+
+summary(gam_baseline)
+AIC(gam_baseline, gam_montrt, gam_montrt_ixn)
+```
+
+In this model, the "Monitor+Trt" strategy is considered the "baseline" and we compare both the Treatment only and "None" groups to this one. In the additive model, there are not significant effects, however, in examining the interaction model see that the growth rate of Varroa over time is significantly higher for the Treatment only group compared to the Monitor + Treatment strategy (p value = 0.0032).  The growth rate for Mon + Trt is 0.5% per day, but for Treatment only is 1.7% per day.
+However, we test the overall significance of the interaction versus the baseline model, the result appears not significant (p-value = 0.8245). This somewhat misleading however, as the spatial part of the model is reduced in complexity once we account for Varroa management strategy. 
+
+This is observed in the output as the reduction in effective degrees of freedom (8.83 in the baseline model compared to only 4.48 in the interaction model). (In fact, the spatial predictor is not statistically significant in the monitor/trt interaction model!)
+When we compare AIC, we see that the AIC is only slightly lower for the interaction model (1236) compared to baseline (1238), however the net chagne in model complexity is in favor of the interaction model; though we add terms to the linear part of the model, the reduction in complexity of the spatial fit leads to a model with lower total degrees of freedom. Therefore, we would conclude in favor of the interaction model. 
+
+The reason for this is that the treatment stategies vary spatially. In the plot below, the background shows the spatial predictor part of the model. Positive values indicate higher than average predicted Varroa intensity and negative values indicate lower than average. 
+On the left, is the spatial predictor from the baseline model, and on the right is the spatial predictor from the interaction model. Notice first that the degree of variability is much more in the baseline model, indicating a stronger effect of space. 
+We also mark the location of observed apiaries color coded by their management practice. Consider first the left graph of the baseline model. In central Illinois, where predicted intensity is high, there are a variety of monitoring and treating practices. In Southern Illinois, where predicted intensity is low, nearly everyone monitors. When we compare to the right graph, we see that *after accounting for mangement strategy* the predicted spatial trend is much less strong. 
+
+```{r, echo = FALSE}
+apiary_data1819 %>%
+  bind_cols(spatial = predict(gam_glm_space_lin_nb, type = "terms")[, 2]) %>% 
+  ggplot(aes(Longitude, Latitude, color = spatial)) + 
+  geom_point() + 
+  coord_map()
+
+
+latlon <- expand.grid(Longitude = seq(-91.5, -87.5, by = 0.1),
+            Latitude = seq(37, 42.5, by = 0.1))
+
+SpatialPointsDataFrame(data = latlon,
+                                    coords = latlon[, c("Longitude", "Latitude")],
+                                    proj4string = CRS("+init=epsg:4326")) %>%
+  spTransform(CRS("+init=epsg:3528")) %>%
+  coordinates() %>%
+  as_tibble()%>%
+  rename(x_m = coords.x1,
+         y_m = coords.x2) %>%
+  #rename(x_m = Longitude, 
+  #       y_m = Latitude) %>%
+  mutate(x_m = x_m - 185000,
+         y_m = y_m - 360000,
+         x_km = x_m/1000,
+         y_km = y_m/1000) %>%
+  bind_cols(latlon, day_of_year = 120, montrt="Trt only") %>%
+bind_cols(spatial_base = predict(gam_glm_space_lin_nb, type = "terms", newdata = .)%>% .[,2]) %>%
+  bind_cols(spatial_montrt = predict(gam_montrt_ixn, type = "terms", newdata = .)%>% .[,4]) %>%
+  pivot_longer(spatial_base:spatial_montrt, names_to = "model", values_to = "pred", names_prefix = "spatial_") %>%
+   ggplot(aes(Longitude, Latitude)) + 
+  geom_tile(aes(fill = pred)) + 
+  coord_map() + 
+  scale_fill_viridis(option = "magma") + 
+  borders("state", "illinois", color = "white") + 
+  geom_point(data = apiary_data1819, aes(color = montrt)) +
+  scale_color_manual(values = c("pink", "black", "purple")) +
+  geom_point(data = apiary_data1819, shape = 1, alpha = 0.5) +
+  facet_wrap(~model)
+```
+
+We observe the same phenomena with a box plot comparing the spatial predictor from the baseline model by management strategy. 
+```{r, echo = FALSE}
+apiary_data1819 %>%
+  bind_cols(spatial = predict(gam_glm_space_lin_nb, type = "terms")[, 2]) %>% 
+  mutate(montrt = fct_relevel(montrt, "mon", "Trt only")) %>%
+  ggplot(aes(montrt, spatial)) + 
+  geom_boxplot()
+```
+
+
+As noted above, the spatial component is no longer statistically signficant after accounting for management practice. We test that formally here:
+
+```{r}
+gam_montrt_ixn_nospatial <- apiary_data1819 %>%
+  drop_na(sup_feed) %>%
+     gam(mean_varroa ~ day_of_year   + montrt + montrt:day_of_year,
+                               data = ., family = nb)
+
+summary(gam_montrt_ixn_nospatial)
+anova(gam_montrt_ixn_nospatial, gam_montrt_ixn, test = "Chisq")
+
+AIC(gam_baseline, gam_montrt, gam_montrt_ixn, gam_montrt_ixn_nospatial)
+```
+
+We see that including the spatial component is not significantly better than the model with no spatial component (p-value = 0.53), and the AIC is lowest for the non-spatial model (1230)
+
+## Supplemental Feeding
+
+```{r}
+gam_sup <- apiary_data1819 %>%
+  drop_na(montrt) %>%
+     gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) + sup_feed,
+                               data = ., family = nb)
+
+summary(gam_sup)
+
+
+gam_sup_ixn <- apiary_data1819 %>%
+  drop_na(montrt) %>%
+     gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) + sup_feed + sup_feed:day_of_year,
+                               data = ., family = nb)
+
+summary(gam_sup_ixn)
+exp(summary(gam_sup_ixn)$p.coef)
+
+# growth for supp feeding group:
+exp(0.0238 + -0.0159)
+
+anova(gam_baseline, gam_sup, test = "Chisq")
+anova(gam_baseline, gam_sup_ixn, test = "Chisq")
+
+summary(gam_baseline)
+AIC(gam_baseline, gam_sup, gam_sup_ixn, gam_montrt_ixn)
+```
+
+The majority of apiaries provide supplemental feeding (214, or 80%). 
+Of these, the most common supplement is syrup only (138), or syrup in combination with pollen (29), solid (17), or both (15). Only 15 total apiaries provided supplemental feeding of solids, pollen, or combination, without syrup. 
+
+The rate of growth is 2.4% per day in apiaries that do not supplement, and only 0.8% per day in apiaries that supplement (p-value for test of difference is 0.0007). 
+
+As we can see in the plot below, the practice of supplemental feeding does not seem to vary across the state - the predominant practice across all regions is to provide supplemental feeding. 
+
+```{r, echo = FALSE}
+SpatialPointsDataFrame(data = latlon,
+                                    coords = latlon[, c("Longitude", "Latitude")],
+                                    proj4string = CRS("+init=epsg:4326")) %>%
+  spTransform(CRS("+init=epsg:3528")) %>%
+  coordinates() %>%
+  as_tibble()%>%
+  rename(x_m = coords.x1, 
+         y_m = coords.x2) %>%
+  mutate(x_m = x_m - 185000,
+         y_m = y_m - 360000,
+         x_km = x_m/1000,
+         y_km = y_m/1000) %>%
+  bind_cols(latlon, day_of_year = 120, sup_feed = 0) %>%
+bind_cols(spatial = predict(gam_sup_ixn, type = "terms", newdata = .)%>%
+  .[,4]) %>%
+   ggplot(aes(Longitude, Latitude)) + 
+  geom_tile(aes(fill = spatial)) + 
+  coord_map() + 
+  scale_fill_viridis(option = "magma") + 
+  borders("state", "illinois", color = "white") + 
+  geom_point(data = apiary_data1819, aes(color = as.factor(sup_feed))) +
+  scale_color_manual(values = c("black", "pink")) +
+  geom_point(data = apiary_data1819, shape = 1, alpha = 0.5) + 
+  labs(color = "Supp. Feeding")
+```
+
+## Model quality table for stepwise models
+```{r, echo = FALSE}
+nomiss_data <- apiary_data1819 |> drop_na(montrt, sup_feed, n_colonies_5km)
+
+gam_null_nm <- gam(mean_varroa ~ 1, data = nomiss_data, family = nb)
+gam_space_lin_nm <-gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb) 
+
+gam_glm_trap1_nm <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  TrapezoidAverage,
+                               data = nomiss_data, family = nb)
+gam_glm_insect1_nm <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  Insecticide,
+                               data = nomiss_data, family = nb)
+gam_glm_nesting1_nm <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  Nesting,
+                               data = nomiss_data, family = nb)
+gam_glm_ncol1_nm <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  n_colonies_5km,
+                               data = nomiss_data, family = nb)
+gam_glm_ncol1ixn_nm <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30) +  n_colonies_5km + day_of_year:n_colonies_5km,
+                               data = nomiss_data, family = nb)
+
+glm_montrt_nm_sp <- gam(mean_varroa ~ day_of_year*montrt + s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb)
+glm_sup_nm_sp <- gam(mean_varroa ~ day_of_year*sup_feed + s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb)
+
+
+
+Rsq <- tibble(y = "2018-19", 
+              model = c("Null",
+         "Base",
+         'Management',
+         'Supp. Feed',
+        # 'Mon/Trt/Sup',
+         'Flor',
+         'Ins',
+         'Nest',
+         'Density',
+        'Dens Ixn.'),
+stat = "Rsq",
+value = c(
+summary(gam_null_nm)$r.sq,
+summary(gam_space_lin_nm)$r.sq,
+summary(glm_montrt_nm_sp)$r.sq,
+summary(glm_sup_nm_sp)$r.sq,
+#summary(gam_sup_montrt)$r.sq,
+summary(gam_glm_trap1_nm)$r.sq,
+summary(gam_glm_insect1_nm)$r.sq,
+summary(gam_glm_nesting1_nm)$r.sq,
+summary(gam_glm_ncol1_nm)$r.sq,
+summary(gam_glm_ncol1ixn_nm)$r.sq)
+)
+
+
+
+
+
+
+AICs <- tibble(y = "2018-19",
+                model = c("Null",
+         "Base",
+         'Management',
+         'Supp. Feed',
+        # 'Mon/Trt/Sup',
+         'Flor',
+         'Ins',
+         'Nest',
+         'Density',
+        'Dens Ixn.'),
+stat = "AIC",
+ value = c(
+ AIC(gam_null_nm),
+ AIC(gam_space_lin_nm),
+ AIC(glm_montrt_nm_sp),
+ AIC(glm_sup_nm_sp),
+ AIC(gam_glm_trap1_nm), 
+ AIC(gam_glm_insect1_nm), 
+ AIC(gam_glm_nesting1_nm),
+ AIC(gam_glm_ncol1_nm),
+ AIC(gam_glm_ncol1ixn_nm) )
+)
+
+apiary_data1819 %>%
+  bind_rows(apiary_data2021) %>%
+    bind_cols(predNull = predict(gam_null_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predBase = predict(gam_space_lin_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predMT = predict(glm_montrt_nm_sp, newdata =  ., type = "response")) %>%
+    bind_cols(predS = predict(glm_sup_nm_sp, newdata =  ., type = "response")) %>%
+  #  bind_cols(predSMT = predict(gam_sup_montrt, newdata =  ., type = "response")) %>%
+    bind_cols(predT = predict(gam_glm_trap1_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predI = predict(gam_glm_insect1_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predN = predict(gam_glm_nesting1_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predNC = predict(gam_glm_ncol1_nm, newdata =  ., type = "response")) %>%
+      bind_cols(predNCi = predict(gam_glm_ncol1ixn_nm, newdata =  ., type = "response")) %>%
+
+  # Calculate difference between observed and predicted for each model.
+  mutate(Null = mean_varroa - predNull, 
+         Base = mean_varroa - predBase,
+         Management = mean_varroa - predMT,
+         `Supp. Feed` = mean_varroa - predS,
+    #     'Mon/Trt/Sup' = mean_varroa - predSMT,
+         Flor = mean_varroa - predT,
+         Ins = mean_varroa - predI,
+         Nest = mean_varroa - predN,
+         Density = mean_varroa - predNC,
+        `Dens Ixn.` = mean_varroa - predNCi,
+         y = ifelse(Year <=2019, "2018-19", "2020-21")) %>% 
+  group_by(y) %>%
+    summarize(across(Null:`Dens Ixn.`, list(
+          MAE = function(x) mean(abs(x), na.rm = TRUE),
+          ErrorPredRatio = function(x) mean(abs(x)/predBase, na.rm = TRUE)
+)
+    )) %>%
+  pivot_longer(-y, names_to = "name", values_to = "value") %>%
+  separate(name, into = c("model", "stat"), sep = "_") %>%
+  bind_rows(Rsq) %>%
+  bind_rows(AICs) %>%
+  pivot_wider(names_from = model, values_from = value) %>%
+  arrange(y, stat) %>%
+  relocate(Flor, Ins, Nest, Density, `Dens Ixn.`, .before = Management) %>%
+  xtable(digits = 2)
+  #kableExtra::kable(format = "latex", digits = 2)
+```
+
+
+# Multiple regression models
+
+We have three variables which wree significant in the individual models: colony density, management practice, and supplemental feeding. 
+
+First we consider the models with both beekeeper variables, management and feeding
+
+## Multiple regression: Management + Feeding
+
+Next we consider a multiple regression that includes both management and feeding, with interactions.
+
+```{r}
+gam_sup_montrt <- gam(mean_varroa ~ day_of_year*sup_feed  + day_of_year*montrt + s(x_km, y_km, k = 30),
+                               data = apiary_data1819, family = nb)
+
+
+summary(gam_sup_montrt)
+
+ 
+gam_sup_montrt_no_sp <- gam(mean_varroa ~ day_of_year*sup_feed  + day_of_year*montrt ,
+                               data = apiary_data1819, family = nb)
+
+
+summary(gam_sup_montrt_no_sp)
+
+anova(gam_montrt_ixn_nospatial, gam_sup_montrt_no_sp, test = "Chisq")
+anova(gam_montrt_ixn, gam_sup_montrt, test = "Chisq")
+
+anova(gam_sup_ixn, gam_sup_montrt, test = "Chisq")
+
+AIC(gam_baseline, gam_montrt_ixn, gam_sup_ixn, gam_sup_montrt, gam_sup_montrt_no_sp)
+```
+
+Adding supplemental feeding to the monitor/trt model is an improvement (with [p <0.0001] or without [0.0013] spatial predictor also included). 
+Adding monitoring to the supplemental feeding model is not an improvement (p = 0.7157)
+AIC is also lower in the supplemental feeding model compared to the model with both supplemental feeding and monitoring/treatment. 
+
+This suggests that while management practice is important for Varroa control, supplemental feeding is more important. 
+Even after accounting for supplemental feeding however, we do see that the "Treat only" group has faster Varroa growth than the "Monitor +Trt" group. Thus we conclude monitoring (and treating) reduces Varroa growth rate, after accounting for the effect of supplementing.
+The majority of apiaries (58% in 2018-19) implement both practices.
+
+
+## Multiple regression with colony density.
+
+The only environmental predictor which was potentially siginficant is the colony density. Here we investigate colony density with feeding, management practice, and both variables. In order to do LRT and compare AIC we need to be sure all the models are fit to the same size dataset. 
+
+```{r}
+gam_sup_ncol <- gam(mean_varroa ~ day_of_year*sup_feed  + day_of_year*n_colonies_5km + s(x_km, y_km, k = 30),
+                               data = apiary_data1819, family = nb)
+
+summary(gam_sup_ncol)
+
+gam_sup2 <- gam(mean_varroa ~ day_of_year*sup_feed   + s(x_km, y_km, k = 30),
+                               data = drop_na(apiary_data1819, n_colonies_5km), family = nb)
+anova(gam_sup2, gam_sup_ncol, test = "Chisq")
+```
+Adding colony density to the supp feeding model is a significant improvement.
+
+
+```{r}
+gam_montrt_ncol <- gam(mean_varroa ~ day_of_year*montrt  + day_of_year*n_colonies_5km + s(x_km, y_km, k = 30),
+                               data = apiary_data1819, family = nb)
+
+summary(gam_montrt_ncol)
+
+gam_montrt2 <- gam(mean_varroa ~ day_of_year*montrt   + s(x_km, y_km, k = 30),
+                               data = drop_na(apiary_data1819, n_colonies_5km), family = nb)
+
+anova(gam_montrt2, gam_montrt_ncol, test = "Chisq")
+```
+Adding colony density to the model with just management is not significant improvement
+
+```{r}
+AIC(gam_sup2, gam_sup_ncol, gam_montrt2, gam_montrt_ncol)
+```
+
+
+```{r}
+nomiss_data <- apiary_data1819 |> drop_na(montrt, sup_feed, n_colonies_5km)
+
+glm_montrt_sup_nm_sp <- gam(mean_varroa ~ day_of_year*montrt + day_of_year*sup_feed + s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb)
+
+glm_sup_feed_ncol_montrt_nm_sp <- gam(mean_varroa ~ day_of_year*sup_feed + day_of_year*n_colonies_5km + day_of_year*montrt+ s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb)
+
+summary(glm_sup_feed_ncol_montrt_nm_sp)
+
+anova(glm_montrt_sup_nm_sp, glm_sup_feed_ncol_montrt_nm_sp, test = "Chisq")
+```
+Adding colony density to the model with both management and supplemental feeding is not a significant improvement.
+
+
+## Comparison of multiple regression models with AIC
+
+The likelihood ratio tests above can only be used to compared nested models (adding predictors). AIC can be used to compare any two models fit to the same dataset. This will allow us to compare the model with only supplemental feeding to the model with only managaement, for example. 
+
+As we noted that the management practice variable seemed to account for most of the spatial variation, we also compare the AIC for models fit with and without the spatial predictor term.
+
+
+```{r nosp_models, include = FALSE}
+# Not spatial
+
+glm_montrt_nm <- gam(mean_varroa ~ day_of_year*montrt,
+                               data = nomiss_data, family = nb)
+
+summary(glm_montrt_nm)
+
+
+glm_sup_nm <- gam(mean_varroa ~ I(day_of_year-120)*sup_feed,
+                               data = nomiss_data, family = nb)
+
+summary(glm_sup_nm)
+
+glm_ncol_nm <- gam(mean_varroa ~ day_of_year*n_colonies_5km,
+                               data = nomiss_data, family = nb)
+
+summary(glm_ncol_nm)
+
+
+glm_montrt_sup_nm <- gam(mean_varroa ~ day_of_year*montrt + day_of_year*sup_feed,
+                               data = nomiss_data, family = nb)
+
+summary(glm_montrt_sup_nm)
+
+glm_montrt_ncol_nm <- gam(mean_varroa ~ day_of_year*montrt + day_of_year*n_colonies_5km,
+                               data = nomiss_data, family = nb)
+
+summary(glm_montrt_ncol_nm)
+
+
+glm_sup_feed_ncol_nm <- gam(mean_varroa ~ day_of_year*sup_feed + day_of_year*n_colonies_5km,
+                               data = nomiss_data, family = nb)
+
+summary(glm_sup_feed_ncol_nm)
+
+glm_sup_feed_ncol_montrt_nm <- gam(mean_varroa ~ day_of_year*sup_feed + day_of_year*n_colonies_5km + day_of_year*montrt,
+                               data = nomiss_data, family = nb)
+
+summary(glm_sup_feed_ncol_montrt_nm)
+
+
+anova(glm_montrt_sup_nm, glm_sup_feed_ncol_montrt_nm, test = "Chisq")
+
+(aic_no_sp <- AIC(glm_sup_nm, glm_montrt_nm, glm_ncol_nm, glm_montrt_sup_nm, glm_montrt_ncol_nm, glm_sup_feed_ncol_nm, glm_sup_feed_ncol_montrt_nm))
+```
+
+
+
+```{r sp_models, include = FALSE}
+# spatial
+
+glm_ncol_nm_sp <- gam(mean_varroa ~ day_of_year*n_colonies_5km + s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb)
+
+summary(glm_ncol_nm_sp)
+
+
+glm_montrt_sup_nm_sp <- gam(mean_varroa ~ day_of_year*montrt + day_of_year*sup_feed + s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb)
+
+summary(glm_montrt_sup_nm_sp)
+
+glm_montrt_ncol_nm_sp <- gam(mean_varroa ~ day_of_year * montrt + day_of_year * n_colonies_5km + s(x_km, y_km, k = 30), 
+        data = nomiss_data, family = nb)
+
+
+summary(glm_montrt_ncol_nm_sp)
+
+
+glm_sup_feed_ncol_nm_sp <- gam(mean_varroa ~ day_of_year*sup_feed + day_of_year*n_colonies_5km+ s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb)
+
+summary(glm_sup_feed_ncol_nm_sp)
+
+glm_sup_feed_ncol_montrt_nm_sp <- gam(mean_varroa ~ day_of_year*sup_feed + day_of_year*n_colonies_5km + day_of_year*montrt+ s(x_km, y_km, k = 30),
+                               data = nomiss_data, family = nb)
+
+summary(glm_sup_feed_ncol_montrt_nm_sp)
+
+anova(glm_montrt_sup_nm_sp, glm_sup_feed_ncol_montrt_nm, test = "Chisq")
+```
+
+```{r, echo = FALSE}
+AIC(glm_sup_nm_sp, glm_montrt_nm_sp, glm_ncol_nm_sp, glm_montrt_sup_nm_sp, glm_montrt_ncol_nm_sp, glm_sup_feed_ncol_nm_sp, glm_sup_feed_ncol_montrt_nm_sp) |>
+  tibble::rownames_to_column("model") |>
+  mutate(model = str_remove(model, "_sp")) |>
+  left_join(tibble::rownames_to_column(aic_no_sp, "model"), join_by(model),suffix = c("sp", "no_sp")) |>
+  mutate(modelname = case_when(model == "glm_sup_nm" ~ "SuppFeed",
+                               model == "glm_montrt_nm" ~ "Manage",
+                               model == "glm_ncol_nm" ~ "Density",
+                               model == "glm_montrt_sup_nm" ~ "SuppFeed, Manage",
+                               model == "glm_montrt_ncol_nm" ~ "Manage, Density",
+                               model == "glm_sup_feed_ncol_nm" ~ "SuppFeed, Density",
+                               model == "glm_sup_feed_ncol_montrt_nm" ~ "SuppFeed, Manage, Density")
+  ) |>
+  select(-model) |>
+  relocate(modelname) |> 
+  tibble::column_to_rownames("modelname") |> 
+  xtable(digits = c( 0, 1, 1, 0, 1))
+```
+
+
+After accounting for supplmenting and management practice, higher colony density still has a small positive effect on Varroa density, although p-value = 0.0632 in model with spatial predictor.
+
+```{r}
+apiary_data1819 |>
+#  bind_rows(apiary_data2021) |>
+  count(sup_feed, montrt) |>
+  drop_na() |>
+  mutate(prop = round(n/sum(n), 2))
+```
+
+
+## Model quality table for multiple regression models
+```{r, echo = FALSE}
+Rsq <- tibble(y = "2018-19", 
+              model = c(
+         "Density",
+         'Management',
+         'Supp. Feed',
+         'Dens/Manage',
+         'Dens/Supp',
+         'Manage/Supp',
+         'Dens/Man/Supp'),
+stat = "Rsq",
+value = c(
+summary(glm_ncol_nm_sp)$r.sq,
+summary(glm_montrt_nm_sp)$r.sq,
+summary(glm_sup_nm_sp)$r.sq,
+summary(glm_montrt_ncol_nm_sp)$r.sq,
+summary(glm_sup_feed_ncol_nm_sp)$r.sq,
+summary(glm_montrt_sup_nm_sp)$r.sq,
+summary(glm_sup_feed_ncol_montrt_nm_sp)$r.sq
+)
+)
+
+AICs <- tibble(y = "2018-19",
+                  model = c(
+         "Density",
+         'Management',
+         'Supp. Feed',
+         'Dens/Manage',
+         'Dens/Supp',
+         'Manage/Supp',
+         'Dens/Man/Supp'),
+stat = "AIC",
+ value = c(
+ AIC(glm_ncol_nm_sp),
+ AIC(glm_montrt_nm_sp),
+ AIC(glm_sup_nm_sp),
+ AIC(glm_montrt_ncol_nm_sp),
+ AIC(glm_sup_feed_ncol_nm_sp), 
+ AIC(glm_montrt_sup_nm_sp), 
+ AIC(glm_sup_feed_ncol_montrt_nm_sp)
+ )
+)
+
+apiary_data1819 %>%
+  bind_rows(apiary_data2021) %>%
+      bind_cols(predBase = predict(gam_space_lin_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predDens = predict(glm_ncol_nm_sp, newdata =  ., type = "response")) %>%
+    bind_cols(predManage = predict(glm_montrt_nm_sp, newdata =  ., type = "response")) %>%
+    bind_cols(predSupp = predict(glm_sup_nm_sp, newdata =  ., type = "response")) %>%
+    bind_cols(predManDens = predict(glm_montrt_ncol_nm_sp, newdata =  ., type = "response")) %>%
+    bind_cols(predSupDens = predict(glm_sup_feed_ncol_nm_sp, newdata =  ., type = "response")) %>%
+    bind_cols(predManSup = predict(glm_montrt_sup_nm_sp, newdata =  ., type = "response")) %>%
+    bind_cols(predManSupDens = predict(glm_sup_feed_ncol_montrt_nm_sp, newdata =  ., type = "response")) %>%
+
+  # Calculate difference between observed and predicted for each model.
+  mutate(Density = mean_varroa - predDens, 
+         Management = mean_varroa - predManage,
+          `Supp. Feed`= mean_varroa - predSupp,
+          `Dens/Manage` = mean_varroa - predManDens,
+         `Dens/Supp` = mean_varroa - predSupDens,
+         `Manage/Supp` = mean_varroa - predManSup,
+         `Dens/Man/Supp` = mean_varroa - predManSupDens,
+         y = ifelse(Year <=2019, "2018-19", "2020-21")) %>% 
+  group_by(y) %>%
+    summarize(across(Density:`Dens/Man/Supp`, list(
+          MAE = function(x) mean(abs(x), na.rm = TRUE),
+          ErrorPredRatio = function(x) mean(abs(x)/predBase, na.rm = TRUE)
+)
+    )) %>%
+  pivot_longer(-y, names_to = "name", values_to = "value") %>%
+  separate(name, into = c("model", "stat"), sep = "_") %>%
+  bind_rows(Rsq) %>%
+  bind_rows(AICs) %>%
+  pivot_wider(names_from = model, values_from = value) %>%
+  arrange(y, stat)%>% 
+  # mutate(ystat = str_c(y, stat, sep = " ")) %>%
+  # select(-y) %>%
+  # tibble::column_to_rownames("ystat") %>%
+  xtable(digits = 2, caption = "Multiple regression comparison, with spatial component.")
+```
+
+
+```{r, echo = FALSE}
+Rsq <- tibble(y = "2018-19", 
+              model = c(
+         "Density",
+         'Management',
+         'Supp. Feed',
+         'Dens/Manage',
+         'Dens/Supp',
+         'Manage/Supp',
+         'Dens/Man/Supp'),
+stat = "Rsq",
+value = c(
+summary(glm_ncol_nm)$r.sq,
+summary(glm_montrt_nm)$r.sq,
+summary(glm_sup_nm)$r.sq,
+summary(glm_montrt_ncol_nm)$r.sq,
+summary(glm_sup_feed_ncol_nm)$r.sq,
+summary(glm_montrt_sup_nm)$r.sq,
+summary(glm_sup_feed_ncol_montrt_nm)$r.sq
+)
+)
+
+AICs <- tibble(y = "2018-19",
+                  model = c(
+         "Density",
+         'Management',
+         'Supp. Feed',
+         'Dens/Manage',
+         'Dens/Supp',
+         'Manage/Supp',
+         'Dens/Man/Supp'),
+stat = "AIC",
+ value = c(
+ AIC(glm_ncol_nm),
+ AIC(glm_montrt_nm),
+ AIC(glm_sup_nm),
+ AIC(glm_montrt_ncol_nm),
+ AIC(glm_sup_feed_ncol_nm), 
+ AIC(glm_montrt_sup_nm), 
+ AIC(glm_sup_feed_ncol_montrt_nm)
+ )
+)
+
+apiary_data1819 %>%
+  bind_rows(apiary_data2021) %>%
+      bind_cols(predBase = predict(gam_space_lin_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predDens = predict(glm_ncol_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predManage = predict(glm_montrt_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predSupp = predict(glm_sup_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predManDens = predict(glm_montrt_ncol_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predSupDens = predict(glm_sup_feed_ncol_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predManSup = predict(glm_montrt_sup_nm, newdata =  ., type = "response")) %>%
+    bind_cols(predManSupDens = predict(glm_sup_feed_ncol_montrt_nm, newdata =  ., type = "response")) %>%
+
+  # Calculate difference between observed and predicted for each model.
+  mutate(Density = mean_varroa - predDens, 
+         Management = mean_varroa - predManage,
+          `Supp. Feed`= mean_varroa - predSupp,
+          `Dens/Manage` = mean_varroa - predManDens,
+         `Dens/Supp` = mean_varroa - predSupDens,
+         `Manage/Supp` = mean_varroa - predManSup,
+         `Dens/Man/Supp` = mean_varroa - predManSupDens,
+         y = ifelse(Year <=2019, "2018-19", "2020-21")) %>% 
+  group_by(y) %>%
+    summarize(across(Density:`Dens/Man/Supp`, list(
+          MAE = function(x) mean(abs(x), na.rm = TRUE),
+          ErrorPredRatio = function(x) mean(abs(x)/predBase, na.rm = TRUE)
+)
+    )) %>%
+  pivot_longer(-y, names_to = "name", values_to = "value") %>%
+  separate(name, into = c("model", "stat"), sep = "_") %>%
+  bind_rows(Rsq) %>%
+  bind_rows(AICs) %>%
+  pivot_wider(names_from = model, values_from = value) %>%
+  arrange(y, stat) %>%
+  xtable(digits = 2, caption = "Multiple regression comparison, without spatial component.")
+```
+
+
+# Initial and growth rates
+```{r, include = FALSE, eval= FALSE}
+b1 <- summary(glm_sup_feed_ncol_montrt_nm)$p.coef
+
+# Intial rates at day_of_year = 120, ncol = 5
+# no sup, trt only
+sum(c(1, 120, 0, 5, 0, 1) * b1[1:6]) |> exp()
+
+# sup, trt only
+sum(c(1, 120, 1, 5, 0, 1) * b1[1:6]) |> exp()
+
+# no sup, mon/trt
+sum(c(1, 120, 0, 5, 0, 0) * b1[1:6]) |> exp()
+
+cl# sup, mon/trt
+sum(c(1, 120, 1, 5, 0, 0) * b1[1:6]) |> exp()
+
+
+# Growth rates with ncol = 5
+
+# no sup, trt only
+sum(c(0, 5, 0, 1) * b1[7:10]) |> exp()
+
+# sup, trt only
+sum(c(1, 5, 0, 1) * b1[7:10]) |> exp()
+
+# no sup, mon/trt
+sum(c(0, 5, 0, 0) * b1[7:10]) |> exp()
+
+# sup, mon/trt
+sum(c(1, 5, 0, 0) * b1[7:10]) |> exp()
+
+```
+
+Visualizing results
+```{r, echo = FALSE}
+apiary_data1819 |> drop_na(montrt, sup_feed) |> ggplot(aes(day_of_year, mean_varroa)) + geom_point(aes(col = (n_colonies_5km+.1)))+ geom_smooth(se = FALSE, span = 2) +facet_grid(fct_relevel(montrt, "mon", "Trt only")~sup_feed) + scale_color_gradient(low = "white", high = "orange", trans = "log") + labs(color = "Num colonies\nwithin 5km")
+
+
+
+pred_data <- expand.grid(day_of_year = 120:300, sup_feed = c(0, 1), montrt = c("mon", "Trt only", "none"), n_colonies_5km = 5, x_km = 0, y_km = 0) |> as_tibble()
+
+pred_data <- predict(glm_sup_feed_ncol_montrt_nm_sp, newdata = pred_data, type = "link", se.fit = TRUE) |>
+  as_tibble() |>
+  mutate(mean_varroa = exp(fit), 
+         mean_lb = exp(fit - 2*se.fit), 
+         mean_ub = exp(fit + 2*se.fit)) |>
+  bind_cols(pred_data)|>
+  mutate(sup_feed = ifelse(sup_feed == 0, "No supplemental feeding", "Supplemental feeding"),
+         montrt  = fct_relevel(montrt, "mon", "Trt only"),
+         montrt = fct_recode(montrt, "Monitor + Treat" = "mon", "Treat only" = "Trt only", "None" = "none"),
+         plot_day = ymd("2018-01-01") + day_of_year -1)
+
+multi_reg_plot <- apiary_data1819 |> 
+  drop_na(montrt, sup_feed) |> 
+  mutate(sup_feed = ifelse(sup_feed == 0, "No supplemental feeding", "Supplemental feeding"),
+         montrt  = fct_relevel(montrt, "mon", "Trt only"),
+         montrt = fct_recode(montrt, "Monitor + Treat" = "mon", "Treat only" = "Trt only", "None" = "none"),
+         plot_day = make_date(year = 2018, month = month(Inspection_Date), day = mday(Inspection_Date))) |>
+  ggplot(aes(plot_day, mean_varroa)) + 
+  #geom_point(aes(col = ifelse(Year < 2020, "2018-19", "2020-21")), alpha = 0.5)+ 
+  geom_point(aes(col = n_colonies_5km)) +
+  geom_point(col = "black", shape = 1, alpha = 0.1) +
+#  geom_smooth(se = FALSE, span = 2, alpha = 0.5) +
+  geom_line(data = pred_data) + 
+  geom_ribbon(data = pred_data, aes(ymin = mean_lb, ymax = mean_ub), alpha = 0.1) +
+  facet_grid(montrt~sup_feed) + 
+  scale_color_gradient(low = "white", high = "orange") + 
+  labs(color = "Num colonies\nwithin 5km",
+       x = "Time", 
+       y = "Varroa Intensity (mites per 300 Bees)") +
+ #   labs(color = "Years") +
+  coord_cartesian(ylim = c(0, 45))  +
+  theme_bw()+
+  scale_x_date(date_breaks = "month", date_labels = "%b")
+
+multi_reg_plot
+
+# pdf("plots/multi_reg_model.pdf", width = 6.5, height = 5)
+# multi_reg_plot
+# dev.off()
+# 
+# postscript("plots/multi_reg_model.eps", width = 6.5, height = 5)
+# multi_reg_plot
+# dev.off()
+
+```
+
+
+## Multiple Regression results
+```{r, echo = FALSE}
+pred_data |> group_by(montrt, sup_feed) |> slice(1:2) |> select(mean_varroa, montrt, sup_feed, day_of_year) |> pivot_wider(names_from= day_of_year, values_from = mean_varroa) |> mutate(rate = `121`/`120`, pct_rate = (rate - 1)*100) |> rename("May 1" = `120`) |> select(-`121`)|> xtable(digits = c(0, 0, 0, 2, 3, 2), caption = "May 1 is the mean Varroa intensity predicted for May 1; rate is the daily growth rate of Varroa as a multiplicative factor; pct_rate is the daily growth rate of Varroa as percent change (0-100)")
+
+
+pred_data2 <- expand.grid(day_of_year = 120:121, sup_feed = 1, montrt = "Trt only", n_colonies_5km = c(0, 1, 2, 5, 10, 20, 60), x_km = 0, y_km = 0) |> as_tibble()
+
+pred_data2 <- predict(glm_sup_feed_ncol_montrt_nm_sp, newdata = pred_data2, type = "link", se.fit = TRUE) |>
+  as_tibble() |>
+  mutate(mean_varroa = exp(fit), 
+         mean_lb = exp(fit - 2*se.fit), 
+         mean_ub = exp(fit + 2*se.fit)) |>
+  bind_cols(pred_data2)|>
+  mutate(sup_feed = ifelse(sup_feed == 0, "No supplemental feeding", "Supplemental feeding"),
+        # montrt  = fct_relevel(montrt, "mon", "Trt only"),
+         montrt = fct_recode(montrt, "Treat only" = "Trt only"),
+         plot_day = ymd("2018-01-01") + day_of_year -1)
+
+
+pred_data2 |> 
+  group_by(n_colonies_5km) |> select(mean_varroa, montrt, sup_feed, day_of_year) |> pivot_wider(names_from= day_of_year, values_from = mean_varroa) |> mutate(rate = `121`/`120`, pct_rate = (rate - 1)*100) |> rename("May 1" = `120`) |> select(-montrt, -sup_feed, -`121`)|> xtable(digits = c(0, 0, 2, 3, 2), caption = "Predicted Varroa intensity and daily Varroa growth rate from multiple regression model assuming Monitor + Treat management strategy and Supplemental feeding. Values are estimated for a colony density of 5 colonies within 5km (the median value)May 1 is the mean Varroa intensity predicted for May 1; rate is the daily growth rate of Varroa as a multiplicative factor; pct_rate is the daily growth rate of Varroa as percent change (0-100)")
+
+
+```
+
+
+# Overall conclusions
+
+* The large-scale spatial variability in Varroa intensity is mostly explained by differences in Varroa management practices across the state; specifically, a higher prevalence of no monitoring in central and western Illinois. 
+
+* There is evidence that both monitoring and treating for Varroa is more effective than treating only by reducing growth of Varroa. 
+
+* Supplemental feeding is associated with a reduction in Varroa growth rate, after accounting for management practice (monitor/treat) and colony density (number of colonies within 5km). 
+
+* There is evidence of a positive association of Varroa growth rate with colony density, although the magnitude is small, and it is not statistically significant after accounting for both management practice and supplemental feeding. The median number of colonies within 5km is 5, and 75% of apiaries in the 2018-19 dataset have 10 or fewer neighbors within 5km. 
+The 90th percentile is 18 colonies and the maximum is 68. The highest density areas are in the Northeast and central Illinois. 
+The daily growth of Varroa is about 1.004 times higher for each additional 10 colonies within 5 km. The model does also predict lower initial Varroa intensity for high density areas, so the expected mean Varroa in high density regions does not surpass that of low density regions until mid August.
+
+* Despite its weaker association in the 2018-19 data, colony density has the lowest relative prediction error when predicting Varroa intensity on the 2020-21 test data.
+
+
+
+### Additional:
+Check if supplemental feed relates to floral quality
+
+```{r}
+ggplot(apiary_data1819) + 
+  geom_density(aes(color = as.factor(Sup_feeding_Prox), TrapezoidAverage))
+
+
+apiary_data1819 |>
+  group_by(Sup_feeding_Prox) |>
+  summarize(mean(TrapezoidAverage), sd(TrapezoidAverage))
+
+sup_feed_model <- glm(Sup_feeding_Prox ~ TrapezoidAverage, family = "binomial", data = apiary_data1819)
+
+summary(sup_feed_model)
+```
+
+No apparent relationship of supplemental feeding to floral quality. 
+
+
+
+## Check for spatial autocorrelation
+
+```{r}
+bees <- apiary_data1819 %>%
+     bind_cols(pred = predict(gam_glm_space_lin_nb, newdata =  ., type = "response")) %>%
+  mutate(resid = mean_varroa - pred)|>
+  select(Latitude, Longitude, Year, day_of_year, mean_varroa, x_km, y_km, pred, resid) |>
+  drop_na(pred)
+
+unnest(bees, cols = pred:resid)
+
+drop_na(bees, x_km, y_km)
+
+library(sp)
+library(gstat)
+coordinates(bees) = ~ x_km + y_km
+
+class(bees)
+
+
+v.emp <- variogram(resid ~ 1, data = bees, cloud = FALSE, width = 1, cutoff = 25)
+plot(v.emp, main = "Empirical Semivariogram of Residuals, Baseline model", xlab = "Distance (km)")
+
+v.fit <- fit.variogram(v.emp, 
+                            vgm("Mat", psill =40, nugget = 0.1, range = .1))
+
+v.emp
+
+plot(v.emp, model = v.fit, main = "Fitted Semivariogram")
+
+
+#pdf("plots/residual_semivariogram.pdf", width = 6.5, height = 5)
+plot(v.emp, xlab = "Distance (km)")
+#dev.off()
+```
+
+# Test for temporal autocorrelation
+```{r}
+bees_ts <- bees |> as_tibble() |>
+  mutate(day = (Year-2018)*365 + day_of_year) |>
+  arrange(day) |>
+  group_by(day) |>
+  summarize(resid = mean(resid),
+            varroa = mean(mean_varroa)) |>
+  right_join(tibble(day = 123:662)) |>
+  arrange(day)
+
+
+#pdf("plots/residual_temporal_autocorrelation.pdf", width = 6.5, height = 6)
+par(mfrow = c(2, 1))
+acf(bees_ts$resid, na.action = na.exclude, main = "A. Autocorrelation of residuals", xlab = "Lag (days)")
+
+acf(bees_ts$varroa, na.action = na.exclude, main = "B. Autocorrelation of Varroa intensity", xlab = "Lag (days)")
+#dev.off()
+
+
+bees_ts |>
+  mutate(lagresid = lag(resid), 
+         dif = resid - lagresid) |>
+  count(is.na(dif))
+
+```

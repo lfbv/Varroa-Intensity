@@ -1,0 +1,270 @@
+---
+title: "Produce Plots for paper"
+date: "2023-07-26"
+output: pdf_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r, include = FALSE, message = FALSE, warning=FALSE}
+#library(tidyverse)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(forcats)
+library(stringr)
+library(readr)
+library(sf)
+library(gstat)
+#library(nlme)
+library(lubridate)
+library(viridis)
+library(sp)
+library(mgcv)
+```
+
+# Read in data
+
+```{r}
+apiary_data1819 <- read_csv("apiary_data1819.csv")
+apiary_data2021 <- read_csv("apiary_data2021.csv")
+```
+
+
+```{r, include = FALSE}
+gam_glm_space_lin_nb <- gam(mean_varroa ~ day_of_year  + s(x_km, y_km, k = 30),
+                               data = apiary_data1819, family = nb)
+
+```
+
+
+# Plot over time.
+```{r}
+# Predict for May 1: Oct 31
+pred_data_time <- tibble(date = seq(ymd("2018-05-01"), ymd("2018-10-31"), by = "days"),
+       day_of_year = yday(date), 
+       x_km = 0,
+       y_km = 0) %>%
+  bind_cols(time_pred = predict(gam_glm_space_lin_nb, type = "response", newdata = .)) 
+
+
+
+
+
+
+timeplot <- apiary_data1819 |>
+  bind_rows(apiary_data2021) |>
+  select(Latitude, Longitude, mean_varroa, n, Month, day_of_year, Year, Inspection_Date) |>
+  mutate(Time = ifelse(Year < 2020, "2018-19", "2020-21"),
+         plot_day = make_date(year = 2018, month = month(Inspection_Date), day = mday(Inspection_Date))) |>
+  ggplot(aes(plot_day, mean_varroa)) + 
+  geom_point(size = 0.1) +
+  geom_line(data = pred_data_time, aes(x = date, y = time_pred)) +
+  facet_wrap(~Time, ncol = 1) +
+  theme_bw() +
+  labs(y = "Varroa Intensity (mites per 300 Bees)",
+       x = "Time") +
+  scale_x_date(date_breaks = "month", date_labels = "%b")
+
+timeplot
+
+# pdf("plots/base_model_time.pdf", width = 9, height = 5)
+# timeplot
+# dev.off()
+# 
+# postscript("plots/base_model_time.eps", width = 9, height = 5)
+# timeplot
+# dev.off()
+```
+
+
+```{r}
+plot(y_km ~ x_km, pred_data_time)
+```
+
+```{r}
+env_vars<- read_csv("Enviromental Data - broaderHiveOutput3km.csv") |>
+  st_as_sf(coords = c("Long", "Lat")) |>
+  st_set_crs(4326) %>%
+  st_transform(CRS("+init=epsg:3528"))  |> 
+  distinct()
+
+
+
+head(env_vars)
+
+pred_data_kriging <- expand.grid(Longitude = seq(-91.5, -87.5, by = 0.2),
+            Latitude = seq(37, 42.5, by = 0.2)) |>
+  st_as_sf(coords = c("Longitude", "Latitude")) %>%
+  st_join(
+     sfheaders::sf_polygon(
+  obj = map_data("state", "illinois")
+  , x = "long"
+  , y = "lat"
+  , polygon_id = "group"),
+  within = TRUE
+  ) %>%
+ drop_na(group) %>%
+  bind_cols(st_coordinates(.)) %>%
+      rename(Longitude = X, 
+           Latitude = Y) %>%
+  st_set_crs(4326) %>%
+  st_transform(CRS("+init=epsg:3528"))
+```
+
+# Trapezoid Average
+```{r}
+emp.trap <- variogram(TrapezoidAverage ~ 1, data = env_vars, width = 5000)
+fit.trap <- fit.variogram(emp.trap, model = vgm("Exp"))
+plot(emp.trap, fit.trap)
+
+trap.krige <- krige(TrapezoidAverage ~ 1, 
+      env_vars,
+      pred_data_kriging,
+      fit.trap) |>
+  as_tibble()
+
+head(trap.krige)
+
+ggplot(distinct(env_vars)) + 
+  geom_sf(aes(color = TrapezoidAverage)) + 
+  geom_sf(data = distinct(pred_data_kriging), size = 0.1)
+
+
+trap.g <- pred_data_kriging |>
+  bind_cols(trap.krige) |>
+ ggplot(aes(Longitude, Latitude)) + 
+  geom_tile(aes(fill = var1.pred/2)) + 
+  coord_map() + 
+  scale_fill_gradient(low = "white", high = "#006d2c", limits = c(0, 65)) +
+  geom_point(data = apiary_data1819, size = 0.2, shape = 16) +
+#    geom_point(data = apiary_data1819, aes(fill = TrapezoidAverage), shape = 21) +
+  geom_polygon(data = map_data("state", "illinois"), aes(long, lat, group = group), 
+               color = "black", fill = NA) + 
+  theme_bw() + 
+  labs(fill = "Index\n(0-100)",
+       title = "Floral Quality")
+
+
+env_vars |>
+  summarize(across(SpringFloral:TrapezoidAverage, mean))
+
+
+lm(TrapezoidAverage ~ I(SpringFloral + SummerFloral + FallFloral), data = env_vars)
+
+summary(trap.krige)
+```
+
+
+
+# Nesting
+```{r}
+emp.nest <- variogram(Nesting ~ 1, data = env_vars, width = 5000)
+fit.nest <- fit.variogram(emp.nest, model = vgm("Exp"))
+plot(emp.nest, fit.nest)
+
+nest.krige <- krige(Nesting ~ 1, 
+      env_vars,
+      pred_data_kriging,
+      fit.nest) |>
+  as_tibble()
+
+head(nest.krige)
+
+ggplot(distinct(env_vars)) + 
+  geom_sf(aes(color = Nesting)) + 
+  geom_sf(data = distinct(pred_data_kriging), size = 0.1)
+
+
+nest.g <- pred_data_kriging |>
+  bind_cols(nest.krige) |>
+ ggplot(aes(Longitude, Latitude)) + 
+  geom_tile(aes(fill = var1.pred)) + 
+  coord_map() + 
+  scale_fill_gradient(low = "white", high = "#006d2c", limits = c(0, 65)) +
+  geom_point(data = apiary_data1819, size = 0.2, shape = 16) +
+#    geom_point(data = apiary_data1819, aes(fill = Nesting), shape = 21) +
+  geom_polygon(data = map_data("state", "illinois"), aes(long, lat, group = group), 
+               color = "black", fill = NA) + 
+  theme_bw() + 
+  labs(fill = "Index\n(0-100)",
+       title = "Nesting Quality")
+```
+
+
+
+# Insecticide
+```{r}
+emp.insect <- variogram(Insecticide ~ 1, data = env_vars, width = 5000)
+fit.insect <- fit.variogram(emp.insect, model = vgm("Exp"))
+plot(emp.insect, fit.insect)
+
+insect.krige <- krige(Insecticide ~ 1, 
+      env_vars,
+      pred_data_kriging,
+      fit.insect) |>
+  as_tibble()
+
+head(insect.krige)
+
+ggplot(distinct(env_vars)) + 
+  geom_sf(aes(color = Insecticide)) + 
+  geom_sf(data = distinct(pred_data_kriging), size = 0.1)
+
+
+ins.g <- pred_data_kriging |>
+  bind_cols(insect.krige) |>
+ ggplot(aes(Longitude, Latitude)) + 
+  geom_tile(aes(fill = var1.pred)) + 
+  coord_map() + 
+  scale_fill_gradient(low = "white", high = "#c51b8a") +
+  geom_point(data = apiary_data1819, size = 0.2, shape = 16) +
+#    geom_point(data = apiary_data1819, aes(fill = Insecticide), shape = 21) +
+  geom_polygon(data = map_data("state", "illinois"), aes(long, lat, group = group), 
+               color = "black", fill = NA) + 
+  theme_bw() + 
+  labs(fill = "Index\n(>0)",
+       title = "Insecticide Load")
+```
+
+```{r}
+# library(patchwork)
+# pdf("plots/env_vars.pdf", width = 9, height = 5)
+# trap.g + nest.g + ins.g
+# dev.off()
+# 
+# setEPS()
+# postscript("plots/env_vars.eps", width = 9, height = 5)
+# trap.g + nest.g + ins.g
+# dev.off()
+```
+
+
+
+## Figure 1 from paper. Mite burden correlated with viral burden
+```{r}
+mitesvirus <- read_csv("mitesvirus.csv")
+
+mitesvirus
+
+fig1 <- ggplot(mitesvirus, aes(`mites/300 bees`, `Total virus particles present`/1000000)) + 
+  geom_point() + 
+  geom_smooth(method = 'lm', se = FALSE, linewidth = 0.5, color = "black") +
+  theme_bw() + 
+  labs(x = "Varroa Intensity (Mites per 300 bees)", 
+       y = "Total Virus Particles Detected (Millions)")
+
+lm((`Total virus particles present`) ~ `mites/300 bees`, data = mitesvirus) %>% summary()
+
+cor(mitesvirus, use = "pairwise.complete" )
+
+# pdf("plots/mite_vs_virus.pdf", width = 5, height = 4)
+# fig1
+# dev.off()
+# 
+# setEPS()
+# postscript("plots/mite_vs_virus.eps", width = 5, height = 4)
+# fig1
+# dev.off()
+```
+
