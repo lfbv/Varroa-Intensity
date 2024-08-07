@@ -24,18 +24,35 @@ library(stringr)
 library(readr)
 library(sf)
 library(gstat)
-#library(nlme)
 library(lubridate)
 library(viridis)
 library(sp)
 library(mgcv)
 library(xtable)
-#library(kableExtra)
 ```
 
+
+Read in the apiary data, compiled from Illinois inspection reports. 
+Create variables sup_feed as an indicator of whether bees were fed solid, syrup, and/or pollen. 
+Create variable montrt as a factor variable based on whether monitor or treat for Varroa.
+
+Data are read in separately for training (2018-19) and testing (2020-21) data
+
 ```{r}
-apiary_data1819 <- read_csv("apiary_data1819.csv")
-apiary_data2021 <- read_csv("apiary_data2021.csv")
+apiary_data1819 <- read_csv("apiary_data1819.csv") %>%
+   mutate(sup_feed = ifelse(Fed_Solid + Fed_Syrup + Fed_pollen == 0, 0, 1),
+          montrt = ifelse(Monitor_prox == 1, "mon",
+                         ifelse(Treat_prox == 1, "Trt only", "none")),
+         montrt = fct_relevel(montrt, "mon")
+  )
+
+apiary_data2021 <- read_csv("apiary_data2021.csv")%>%
+   mutate(sup_feed = ifelse(Fed_Solid + Fed_Syrup + Fed_pollen == 0, 0, 1),
+          montrt = ifelse(Monitor_prox == 1, "mon",
+                         ifelse(Treat_prox == 1, "Trt only", "none")),
+         montrt = fct_relevel(montrt, "mon")
+  )
+
 ```
 
 # Baseline Model
@@ -1208,14 +1225,14 @@ Check if supplemental feed relates to floral quality
 
 ```{r}
 ggplot(apiary_data1819) + 
-  geom_density(aes(color = as.factor(Sup_feeding_Prox), TrapezoidAverage))
+  geom_density(aes(color = as.factor(sup_feed), TrapezoidAverage))
 
 
 apiary_data1819 |>
-  group_by(Sup_feeding_Prox) |>
+  group_by(sup_feed) |>
   summarize(mean(TrapezoidAverage), sd(TrapezoidAverage))
 
-sup_feed_model <- glm(Sup_feeding_Prox ~ TrapezoidAverage, family = "binomial", data = apiary_data1819)
+sup_feed_model <- glm(sup_feed ~ TrapezoidAverage, family = "binomial", data = apiary_data1819)
 
 summary(sup_feed_model)
 ```
